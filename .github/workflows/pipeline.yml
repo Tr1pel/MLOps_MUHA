@@ -116,6 +116,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      POSTGRES_PASSWORD: ci-only-password
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -153,7 +155,6 @@ jobs:
           APP_IMAGE: ${{ steps.metadata.outputs.image }}@${{ steps.build.outputs.digest }}
           APP_COMMIT: ${{ github.sha }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
-          POSTGRES_PASSWORD: ci-only-password
         run: |
           docker compose pull app db
           docker compose up --no-build --wait --wait-timeout 120
