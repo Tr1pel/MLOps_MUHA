@@ -196,17 +196,3 @@ docker compose up --no-build --wait
 uv run --locked python scripts/smoke.py --version 0.1.0
 Remove-Item Env:APP_IMAGE
 ```
-
-## Демонстрация на защите
-
-1. Показать `docker compose ps`, три эндпоинта и JSON-логи.
-2. Выполнить `docker compose stop db`, показать liveness `200` и dependency health `503`.
-3. Выполнить `docker compose up -d --wait db`, показать восстановление `200`.
-4. Показать тесты с PostgreSQL, branch coverage и pre-commit при коммите.
-5. Сделать push и показать успешные jobs CI и publish, artifact coverage и digest образа.
-6. Показать `/api/v1/version` у образа из GHCR и совпадение commit с GitHub.
-
-Описания использованных механизмов: [uv и Docker](https://docs.astral.sh/uv/guides/integration/docker/),
-[группы зависимостей uv](https://docs.astral.sh/uv/concepts/dependencies/),
-[SQLAlchemy asyncio](https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html),
-[публикация Docker-образов в GitHub Actions](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images).
