@@ -1,19 +1,42 @@
 # syntax=docker/dockerfile:1
-FROM python:3.12.12-slim-bookworm AS builder
+FROM python:3.12.12-slim-bookworm AS builder-base
 COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /usr/local/bin/uv
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
-
 COPY pyproject.toml uv.lock README.md ./
+
+FROM builder-base AS builder
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --group web --no-install-project
 
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --group web --no-editable
+
+# Training image: the web stack plus the train dependency group and the bundled data.
+# Declared before runtime so that a plain `docker build` still ends on the slim image.
+FROM builder-base AS trainer-builder
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --group web --group train --no-install-project
+COPY src/ ./src/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --group web --group train --no-editable
+
+FROM python:3.12.12-slim-bookworm AS trainer
+ARG APP_COMMIT=unknown
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    APP_COMMIT=${APP_COMMIT}
+WORKDIR /app
+RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home app
+COPY --from=trainer-builder --chown=app:app /app/.venv /app/.venv
+COPY --chown=app:app data/ /app/data/
+USER 10001:10001
+CMD ["python", "-m", "agent_platform.training.pipeline"]
 
 FROM python:3.12.12-slim-bookworm AS runtime
 ARG APP_COMMIT=unknown

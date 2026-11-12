@@ -3,20 +3,27 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from agent_platform.api.health import router as health_router
+from agent_platform.api.model import router as model_router
+from agent_platform.api.process import router as process_router
 from agent_platform.api.version import router as version_router
 from agent_platform.core.config import Settings
 from agent_platform.core.logging import RequestLoggingMiddleware, configure_logging, logger
 from agent_platform.core.version import application_version
 from agent_platform.db.connection import create_engine
+from agent_platform.ml.inference import ModelLoader, ModelService, load_registered_model
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, model_loader: ModelLoader = load_registered_model
+) -> FastAPI:
     settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         configure_logging(settings.log_level)
         app.state.engine = create_engine(settings)
+        # The one and only model load of this process; a failure never prevents startup.
+        app.state.model_service = await ModelService.start(settings, model_loader)
         logger.info(
             "application_started",
             extra={"version": application_version(), "commit": settings.app_commit},
@@ -24,6 +31,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            app.state.model_service.close()
             await app.state.engine.dispose()
             logger.info("application_stopped")
 
@@ -36,6 +44,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestLoggingMiddleware)
     app.include_router(health_router)
     app.include_router(version_router)
+    app.include_router(model_router)
+    app.include_router(process_router)
     return app
 
 
