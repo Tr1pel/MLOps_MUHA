@@ -8,6 +8,7 @@ from uuid import uuid4
 import aio_pika
 import pytest
 from conftest import FakePolicy, make_loaded
+from opentelemetry import trace
 from sqlalchemy import text
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
@@ -267,27 +268,48 @@ async def test_message_that_crashes_the_worker_goes_to_dlq_without_running(
     assert await _deliveries(engine, message.task_id) == settings.task_delivery_limit + 1
 
 
-async def test_unparseable_message_goes_to_dlq_without_saving(settings, monitor):
+async def test_poison_message_is_retried_in_one_trace_then_goes_to_dlq_without_saving(
+    settings, monitor, engine, spans
+):
     saved = []
 
     async def save(*args):
         saved.append(args)
         return True
 
+    settings = settings.model_copy(update={"task_delivery_limit": 3})
     producer = make_broker(settings)
     await producer.start()
     await declare_topology(producer, settings)
-    worker = build_worker(settings, FakePolicy(), save)
+    worker = build_worker(settings, FakePolicy(), save, engine)
     await worker.broker.start()
     dlq = dead_letter_queue_name(settings)
+    task_id = uuid4()
     try:
-        await producer.publish({"seed": "not a task"}, queue=settings.tasks_queue, persist=True)
+        with trace.get_tracer("test").start_as_current_span("send") as send:
+            await producer.publish(
+                {"task_id": str(task_id), "seed": -1},
+                queue=settings.tasks_queue,
+                persist=True,
+                correlation_id=str(task_id),
+            )
         await wait_until(lambda: _count_is(monitor, dlq, 1))
         assert await monitor(settings.tasks_queue) == 0
     finally:
         await worker.broker.stop()
         await producer.stop()
     assert saved == []
+    assert await _deliveries(engine, task_id) == 3
+
+    finished = spans.get_finished_spans()
+    process = [s for s in finished if s.name.endswith(" process")]
+    trace_id = send.get_span_context().trace_id
+    assert sorted(s.attributes["messaging.delivery_attempt"] for s in process) == [1, 2, 3]
+    assert {s.context.trace_id for s in process} == {trace_id}  # redeliveries stay in the trace
+    assert any(e.name == "dead_lettered" for s in process for e in s.events)
+    database = [s for s in finished if s.attributes.get("db.system") == "postgresql"]
+    assert database
+    assert {s.context.trace_id for s in database} >= {trace_id}  # DB spans join the same trace
 
 
 async def _count_is(monitor, queue, expected):

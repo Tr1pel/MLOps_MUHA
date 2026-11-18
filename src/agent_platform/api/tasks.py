@@ -12,10 +12,12 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_platform.core.config import Settings
-from agent_platform.core.logging import logger
+from agent_platform.core.logging import logger, task_id_context
 from agent_platform.db.tasks import get_task, insert_pending
 from agent_platform.messaging import (
     BrokerUnavailableError,
@@ -107,24 +109,26 @@ async def create_task(payload: TaskRequest, request: Request):
         max_steps=payload.max_steps,
         enqueued_at=datetime.now(UTC),
     )
+    task_id_context.set(str(message.task_id))
+    span = trace.get_current_span()
+    span.set_attribute("task.id", str(message.task_id))
     # Publish first: if the broker refuses, there is no row to roll back.
     try:
         await publish_task(request.app.state.broker, settings, message)
-    except QueueFullError:
-        logger.warning("task_rejected", extra={"error": "queue_full"})
-        return _reject(settings, "queue_full")
-    except BrokerUnavailableError:
-        logger.warning("task_rejected", extra={"error": "broker_unavailable"})
-        return _reject(settings, "broker_unavailable")
+    except (QueueFullError, BrokerUnavailableError) as exc:
+        reason = "queue_full" if isinstance(exc, QueueFullError) else "broker_unavailable"
+        retry_after = retry_after_seconds(settings)
+        # The 503 is a deliberate answer, but for the trace it is a failed request.
+        span.record_exception(exc)
+        span.set_status(Status(StatusCode.ERROR, reason))
+        logger.warning("task_rejected", extra={"reason": reason, "retry_after": retry_after})
+        return _reject(settings, reason)
     try:
         await insert_pending(request.app.state.engine, message)
     except Exception as exc:
         # The task is already in the queue and the worker upserts its result row, so it will
         # not be lost; failing the request here would make the client resubmit a duplicate.
-        logger.warning(
-            "pending_insert_failed",
-            extra={"task_id": str(message.task_id), "error_type": type(exc).__name__},
-        )
+        logger.warning("pending_insert_failed", extra={"error_type": type(exc).__name__})
     return JSONResponse(
         TaskAccepted(task_id=message.task_id).model_dump(mode="json"),
         status_code=202,

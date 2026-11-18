@@ -1,0 +1,177 @@
+# Observability stack. Nothing here starts with a plain `docker compose up`:
+#   --profile logs           Vector + Loki
+#   --profile traces         OpenTelemetry Collector + Tempo
+#   --profile metrics        OpenTelemetry Collector + Prometheus
+#   --profile observability  everything above plus Grafana
+# Paths are relative to this file. The distroless images (Loki, Tempo, Collector) have no shell
+# or wget, so a static busybox is mounted read-only as an image volume for their healthchecks
+# (needs Docker Engine 28+ and Compose 2.35+).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  otel-collector:
+    profiles: [traces, metrics, observability]
+    image: otel/opentelemetry-collector-contrib:0.165.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      - type: image
+        source: busybox:1.37.0-musl
+        target: /probe
+        read_only: true
+    # OTLP gRPC on loopback only: lets host-side tools (scripts/send_poison.py) send telemetry.
+    ports:
+      - "127.0.0.1:${OTEL_COLLECTOR_PORT:-4317}:4317"
+    healthcheck:
+      test: ["CMD", "/probe/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 192m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+  tempo:
+    profiles: [traces, observability]
+    image: grafana/tempo:2.10.9
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/config.yaml:ro
+      - tempo_data:/var/tempo
+      - type: image
+        source: busybox:1.37.0-musl
+        target: /probe
+        read_only: true
+    healthcheck:
+      test: ["CMD", "/probe/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3200/ready"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+  prometheus:
+    profiles: [metrics, observability]
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-otlp-receiver
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+  loki:
+    profiles: [logs, observability]
+    image: grafana/loki:3.7.10
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+      - type: image
+        source: busybox:1.37.0-musl
+        target: /probe
+        read_only: true
+    healthcheck:
+      test: ["CMD", "/probe/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3100/ready"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+  vector:
+    profiles: [logs, observability]
+    image: timberio/vector:0.61.0-alpine
+    command: ["--config", "/etc/vector/vector.yaml"]
+    depends_on:
+      loki:
+        condition: service_healthy
+    environment:
+      # Vector 0.61 only substitutes ${VAR} in its config when this is set; the container env holds just these two.
+      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION: "true"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-mlops_muha}
+      DEPLOYMENT_ENV: ${DEPLOYMENT_ENV:-dev}
+    volumes:
+      - ./log-agent/vector.yaml:/etc/vector/vector.yaml:ro
+      # Read-only socket: the agent only lists containers and streams their logs.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8686/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 96m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:13.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-grafana-local}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 1.0
+    logging: *logging
+    networks: [backend]
+
+volumes:
+  tempo_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+
+networks:
+  backend:

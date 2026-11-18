@@ -96,6 +96,10 @@ def load_registered_model(settings: Settings) -> LoadedModel:
     # longer than the startup deadline; an operator can still override both in the environment.
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "10")
+    # MLflow would attach its own non-JSON handler to the "mlflow" logger and draw a progress
+    # bar on stderr; both would break one-JSON-object-per-line output.
+    os.environ.setdefault("MLFLOW_CONFIGURE_LOGGING", "false")
+    os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
     client = _make_client(uri)
     try:
         version = client.get_model_version_by_alias(settings.model_name, settings.model_alias)

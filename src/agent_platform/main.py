@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
@@ -9,20 +10,24 @@ from agent_platform.api.tasks import router as tasks_router
 from agent_platform.api.version import router as version_router
 from agent_platform.core.config import Settings
 from agent_platform.core.logging import RequestLoggingMiddleware, configure_logging, logger
+from agent_platform.core.telemetry import instrument_fastapi, setup_telemetry, shutdown_telemetry
 from agent_platform.core.version import application_version
 from agent_platform.db.connection import create_engine
 from agent_platform.db.tasks import ensure_schema
 from agent_platform.messaging import declare_topology, make_broker
 
+SERVICE_NAME = "api"
 BrokerFactory = Callable[[Settings], RabbitBroker]
 
 
 def create_app(settings: Settings | None = None, broker_factory: BrokerFactory = make_broker):
     settings = settings or Settings()
+    # At import time, not in the lifespan: uvicorn logs "Started server process" before it.
+    configure_logging(settings.log_level, SERVICE_NAME)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        configure_logging(settings.log_level)
+        setup_telemetry(SERVICE_NAME, settings)
         app.state.engine = create_engine(settings)
         app.state.broker = broker_factory(settings)
         try:
@@ -38,6 +43,7 @@ def create_app(settings: Settings | None = None, broker_factory: BrokerFactory =
             await app.state.broker.stop()
             await app.state.engine.dispose()
             logger.info("application_stopped")
+            await asyncio.to_thread(shutdown_telemetry)
 
     app = FastAPI(
         title="Virtual Fly Agent Platform",
@@ -46,6 +52,7 @@ def create_app(settings: Settings | None = None, broker_factory: BrokerFactory =
     )
     app.state.settings = settings
     app.add_middleware(RequestLoggingMiddleware)
+    instrument_fastapi(app)
     app.include_router(health_router)
     app.include_router(version_router)
     app.include_router(tasks_router)

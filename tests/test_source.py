@@ -1,14 +1,15 @@
 import asyncio
 import itertools
-import logging
 from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
+from conftest import log_records, metric_total
+from opentelemetry.trace import StatusCode
 
 import agent_platform.source as source
 from agent_platform.core.config import Settings
-from agent_platform.core.logging import logger
+from agent_platform.core.logging import task_id_context
 from agent_platform.messaging import BrokerUnavailableError, QueueFullError
 
 
@@ -127,27 +128,69 @@ async def test_unexpected_errors_are_not_swallowed():
         await run(tasks(1), recorder, [])
 
 
-async def test_progress_is_logged_with_totals_and_rate(monkeypatch):
-    records = []
+async def test_progress_is_logged_with_totals_and_rate_as_fields(log_output):
+    await run(tasks(3), Recorder([QueueFullError()]), [], report_interval=0.0)
 
-    class Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
+    progress = [r for r in log_records(log_output) if r["event"] == "source_progress"]
+    assert progress
+    last = progress[-1]
+    assert (last["published_total"], last["rejected_total"]) == (3, 1)
+    assert last["rate_per_s"] >= 0
+    assert last["level"] == "INFO"
 
-    handler = Capture()
-    monkeypatch.setattr(logger, "handlers", [handler])
-    previous_level = logger.level
-    logger.setLevel(logging.INFO)
-    try:
-        await run(tasks(3), Recorder([QueueFullError()]), [], report_interval=0.0)
-    finally:
-        logger.setLevel(previous_level)
 
-    assert records
-    assert all(line.startswith("source_progress published_total=") for line in records)
-    assert "rejected_total=1" in records[-1]
-    assert "published_total=3" in records[-1]
-    assert "rate_per_s=" in records[-1]
+async def test_each_rejection_is_a_warning_with_attempt_and_delay(log_output):
+    sleeps = []
+    await run(tasks(1), Recorder([QueueFullError(), BrokerUnavailableError()]), sleeps)
+
+    rejected = [r for r in log_records(log_output) if r["event"] == "publish_rejected"]
+    assert [r["level"] for r in rejected] == ["WARNING", "WARNING"]
+    assert [r["attempt"] for r in rejected] == [1, 2]
+    assert [r["reason"] for r in rejected] == ["queue_full", "unavailable"]
+    assert [r["delay_s"] for r in rejected] == [round(d, 3) for d in sleeps]
+    assert all(r["task_id"] and r["trace_id"] for r in rejected)
+
+
+async def test_one_trace_per_task_with_rejection_and_backoff_events(spans):
+    sleeps = []
+    await run(tasks(3), Recorder([QueueFullError(), QueueFullError()]), sleeps)
+
+    roots = [s for s in spans.get_finished_spans() if s.name == "source.publish_task"]
+    assert len(roots) == 3
+    assert len({s.context.trace_id for s in roots}) == 3  # never one trace for the batch
+    assert all(s.parent is None for s in roots)
+    first = roots[0]
+    assert first.attributes["task.seed"] == 0
+    assert first.attributes["task.id"] == str(source.task_id_for("b", 0))
+    events = [(e.name, dict(e.attributes)) for e in first.events]
+    assert [name for name, _ in events] == ["broker_rejected", "backoff"] * 2
+    assert events[0][1] == {"attempt": 1, "reason": "queue_full"}
+    assert events[1][1]["attempt"] == 1
+    assert events[1][1]["delay_s"] == pytest.approx(sleeps[0])
+    assert events[3][1]["attempt"] == 2
+    assert not roots[1].events
+    assert task_id_context.get() is None
+
+
+async def test_metrics_count_published_rejected_and_backoff_seconds():
+    names = ("source.tasks.published", "source.publish.rejected", "source.backoff.duration")
+    before = [metric_total(name) for name in names]
+    sleeps = []
+    await run(tasks(2), Recorder([QueueFullError(), BrokerUnavailableError()]), sleeps)
+    after = [metric_total(name) for name in names]
+
+    assert [a - b for a, b in zip(after, before, strict=True)] == [
+        2,
+        2,
+        pytest.approx(sum(sleeps)),
+    ]
+
+
+async def test_a_failed_publish_that_is_not_backpressure_ends_the_span_with_error(spans):
+    with pytest.raises(ValueError):
+        await run(tasks(1), Recorder([ValueError("bug")]), [])
+    [root] = [s for s in spans.get_finished_spans() if s.name == "source.publish_task"]
+    assert root.status.status_code is StatusCode.ERROR
 
 
 def test_parse_args_defaults_and_validation():
@@ -161,7 +204,9 @@ def test_parse_args_defaults_and_validation():
         source.parse_args([])
 
 
-async def test_run_declares_topology_publishes_everything_and_closes_the_broker(monkeypatch):
+async def test_run_declares_topology_publishes_everything_and_closes_the_broker(
+    monkeypatch, log_output
+):
     events = []
     published = []
 
@@ -189,6 +234,8 @@ async def test_run_declares_topology_publishes_everything_and_closes_the_broker(
     assert code == 0
     assert published == [10, 11, 12, 13]
     assert events == ["start", "topology", "stop"]
+    done = [r for r in log_records(log_output) if r["event"] == "source_done"]
+    assert (done[0]["published_total"], done[0]["rejected_total"]) == (4, 0)
 
 
 async def test_run_closes_the_broker_when_interrupted(monkeypatch):
@@ -216,7 +263,10 @@ def test_main_passes_arguments_to_run(monkeypatch):
         seen.update(count=count, start_seed=start_seed, batch_id=batch_id, max_steps=max_steps)
         return 0
 
+    flushed = []
     monkeypatch.setattr(source, "run", fake_run)
+    monkeypatch.setattr(source, "shutdown_telemetry", lambda: flushed.append(True))
     code = source.main(["--count", "7", "--start-seed", "3", "--batch-id", "x", "--max-steps", "9"])
     assert code == 0
+    assert flushed == [True]  # buffered spans and metrics leave before the process exits
     assert seen == {"count": 7, "start_seed": 3, "batch_id": "x", "max_steps": 9}

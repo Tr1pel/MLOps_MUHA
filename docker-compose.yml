@@ -1,3 +1,6 @@
+include:
+  - observability/compose.yaml
+
 # Settings shared by the API, worker and source so the queue contract cannot drift.
 x-pipeline-env: &pipeline-env
   RABBITMQ_HOST: rabbitmq
@@ -11,6 +14,17 @@ x-pipeline-env: &pipeline-env
   WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
   PUBLISH_TIMEOUT_SECONDS: ${PUBLISH_TIMEOUT_SECONDS:-2}
 
+# Telemetry settings shared by the API, worker and source. Everything is env-driven, and the
+# application runs the same when no observability profile is up.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_always_on}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
+  OTEL_RESOURCE_ATTRIBUTES: service.version=${APP_COMMIT:-unknown},deployment.environment.name=${DEPLOYMENT_ENV:-dev}
+  OTEL_METRIC_EXPORT_INTERVAL: 5000
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+
 services:
   app:
     image: ${APP_IMAGE:-mlops-muha:local}
@@ -19,7 +33,8 @@ services:
       args:
         APP_COMMIT: ${APP_COMMIT:-unknown}
     environment:
-      <<: *pipeline-env
+      <<: [*pipeline-env, *otel-env]
+      OTEL_SERVICE_NAME: api
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
@@ -91,13 +106,15 @@ services:
     image: ${APP_IMAGE:-mlops-muha:local}
     command: ["python", "-m", "agent_platform.worker"]
     environment:
-      <<: *pipeline-env
+      <<: [*pipeline-env, *otel-env]
+      OTEL_SERVICE_NAME: worker
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
       POSTGRES_USER: ${POSTGRES_USER:-agent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR: "false"
       WORKER_HEALTH_PORT: ${WORKER_HEALTH_PORT:-8001}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME:-fly-policy}
@@ -148,7 +165,8 @@ services:
     entrypoint: ["python", "-m", "agent_platform.source"]
     command: ["--count", "100000", "--max-steps", "10"]
     environment:
-      <<: *pipeline-env
+      <<: [*pipeline-env, *otel-env]
+      OTEL_SERVICE_NAME: source
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       HOME: /tmp
     depends_on:

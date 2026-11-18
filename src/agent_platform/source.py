@@ -16,9 +16,11 @@ from time import monotonic
 from uuid import UUID, uuid5
 
 from faststream.rabbit import RabbitBroker
+from opentelemetry import metrics, trace
 
 from agent_platform.core.config import Settings
-from agent_platform.core.logging import configure_logging, logger
+from agent_platform.core.logging import configure_logging, logger, task_id_context
+from agent_platform.core.telemetry import setup_telemetry, shutdown_telemetry
 from agent_platform.messaging import (
     BrokerUnavailableError,
     QueueFullError,
@@ -28,6 +30,13 @@ from agent_platform.messaging import (
     publish_task,
 )
 from agent_platform.sim.env import DEFAULT_MAX_STEPS
+
+SERVICE_NAME = "source"
+tracer = trace.get_tracer("agent_platform.source")
+meter = metrics.get_meter("agent_platform.source")
+published_counter = meter.create_counter("source.tasks.published", unit="{task}")
+rejected_counter = meter.create_counter("source.publish.rejected", unit="{task}")
+backoff_counter = meter.create_counter("source.backoff.duration", unit="s")
 
 TASK_NAMESPACE = UUID("6f1b3c1e-8d0e-4b8e-9a53-2c6f0a1d7e42")
 BACKOFF_BASE_SECONDS = 0.05
@@ -78,27 +87,54 @@ async def run_source(
         nonlocal last_report, published_at_last_report
         rate = (published - published_at_last_report) / max(now - last_report, 1e-9)
         logger.info(
-            "source_progress published_total=%d rejected_total=%d rate_per_s=%.1f",
-            published,
-            rejected,
-            rate,
+            "source_progress",
+            extra={
+                "published_total": published,
+                "rejected_total": rejected,
+                "rate_per_s": round(rate, 1),
+            },
         )
         last_report, published_at_last_report = now, published
 
     for task in tasks:
         failures = 0
-        while True:
+        # One trace per task (never one per batch): the publish span below is its child.
+        with tracer.start_as_current_span(
+            "source.publish_task",
+            attributes={"task.id": str(task.task_id), "task.seed": task.seed},
+        ) as span:
+            token = task_id_context.set(str(task.task_id))
             try:
-                # The task counts as enqueued when the broker accepts it, not when it was generated.
-                await publish(task.model_copy(update={"enqueued_at": datetime.now(UTC)}))
-                break
-            except (QueueFullError, BrokerUnavailableError):
-                rejected += 1
-                failures += 1
-                await sleep(backoff_delay(failures))
-            if monotonic() - last_report >= report_interval:
-                report(monotonic())
+                while True:
+                    try:
+                        # The task counts as enqueued when the broker accepts it, not when it
+                        # was generated.
+                        await publish(task.model_copy(update={"enqueued_at": datetime.now(UTC)}))
+                        break
+                    except (QueueFullError, BrokerUnavailableError) as exc:
+                        rejected += 1
+                        failures += 1
+                        delay = backoff_delay(failures)
+                        reason = "queue_full" if isinstance(exc, QueueFullError) else "unavailable"
+                        span.add_event("broker_rejected", {"attempt": failures, "reason": reason})
+                        span.add_event("backoff", {"attempt": failures, "delay_s": delay})
+                        logger.warning(
+                            "publish_rejected",
+                            extra={
+                                "attempt": failures,
+                                "delay_s": round(delay, 3),
+                                "reason": reason,
+                            },
+                        )
+                        rejected_counter.add(1)
+                        backoff_counter.add(delay)
+                        await sleep(delay)
+                    if monotonic() - last_report >= report_interval:
+                        report(monotonic())
+            finally:
+                task_id_context.reset(token)
         published += 1
+        published_counter.add(1)
         if monotonic() - last_report >= report_interval:
             report(monotonic())
     report(monotonic())
@@ -124,10 +160,19 @@ async def run(
     try:
         await broker.start()
         await declare_topology(broker, settings)
+        logger.info(
+            "source_started",
+            extra={
+                "count": count,
+                "start_seed": start_seed,
+                "batch_id": batch_id,
+                "max_steps": max_steps,
+            },
+        )
         published, rejected = await run_source(
             generate_tasks(count, start_seed, batch_id, max_steps), publish
         )
-        logger.info("source_done published_total=%d rejected_total=%d", published, rejected)
+        logger.info("source_done", extra={"published_total": published, "rejected_total": rejected})
         return 0
     except asyncio.CancelledError:
         logger.info("source_interrupted")
@@ -153,13 +198,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     settings = Settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, SERVICE_NAME)
+    setup_telemetry(SERVICE_NAME, settings)
     try:
         return asyncio.run(
             run(settings, args.count, args.start_seed, args.batch_id, args.max_steps)
         )
     except KeyboardInterrupt:
         return 130
+    finally:
+        # A short-lived process: whatever is still buffered must leave before it exits.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

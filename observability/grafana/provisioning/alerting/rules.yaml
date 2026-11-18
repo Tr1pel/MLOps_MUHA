@@ -1,0 +1,110 @@
+apiVersion: 1
+
+# Rules are evaluated by Grafana against the `prometheus` datasource.
+# noDataState: OK: until the first scrape (or if the broker exporter is down) there is no series,
+# and "no data" must not page anyone; a dead broker is a separate problem and shows on the dashboard.
+# execErrState: Error: if the query itself fails, the rule shows Error instead of silently looking healthy.
+groups:
+  - orgId: 1
+    name: pipeline
+    folder: Конвейер
+    interval: 10s
+    rules:
+      - uid: queue-nearly-full
+        title: Очередь tasks заполнена более чем на 90%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: {type: prometheus, uid: prometheus}
+              # 50 = QUEUE_MAX_LENGTH (x-max-length), same value as the queue_limit variable on the dashboard.
+              expr: rabbitmq_detailed_queue_messages_ready{queue="tasks"} / 50
+              instant: true
+              range: false
+          - refId: B
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              reducer: last
+              settings: {mode: dropNN}
+          - refId: C
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0.9]}
+        noDataState: OK
+        execErrState: Error
+        # 90%: a warning while the 10% headroom (5 messages) is left, before the broker starts
+        # rejecting publications. for 1m: short bursts above 45 during normal work must not flap.
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Очередь tasks заполнена более чем на 90%
+          description: >-
+            Очередь tasks заполнена на {{ humanizePercentage $values.B.Value }} лимита x-max-length (50 сообщений) уже дольше минуты.
+            Воркеры не успевают за источником: скоро брокер начнёт отклонять публикации, а API отвечать 503.
+            Добавьте воркеры или снизьте скорость источника. Дашборд: http://127.0.0.1:3000/d/pipeline
+          __dashboardUid__: pipeline
+          __panelId__: "2"
+
+      - uid: dlq-not-empty
+        title: В DLQ появились сообщения
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: {type: prometheus, uid: prometheus}
+              expr: rabbitmq_detailed_queue_messages{queue="tasks.dlq"}
+              instant: true
+              range: false
+          - refId: B
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              reducer: last
+              settings: {mode: dropNN}
+          - refId: C
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+        noDataState: OK
+        execErrState: Error
+        # Every message in the DLQ is a lost task, so the threshold is 0. for 30s only covers the
+        # scrape delay (15s) and one evaluation, it is not meant to wait for the problem to "settle".
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: В DLQ появились сообщения
+          description: >-
+            В очереди tasks.dlq сообщений: {{ printf "%.0f" $values.B.Value }}. Каждое из них это задача,
+            которую воркер не смог обработать за TASK_DELIVERY_LIMIT доставок, то есть потерянная.
+            Найдите причину по логам level=error и трейсу на дашборде: http://127.0.0.1:3000/d/pipeline
+          __dashboardUid__: pipeline
+          __panelId__: "15"

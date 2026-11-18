@@ -110,6 +110,34 @@ def test_make_broker_enables_confirms_and_prefetch(monkeypatch):
     assert captured["graceful_timeout"] == 9.0
     assert captured["default_channel"].publisher_confirms is True
     assert captured["default_channel"].prefetch_count == 3
+    assert any(type(m).__name__ == "RabbitTelemetryMiddleware" for m in captured["middlewares"])
+
+
+async def test_trace_context_travels_with_the_message_and_the_consumer_continues_it(spans):
+    from faststream.rabbit import TestRabbitBroker
+    from faststream.rabbit.annotations import RabbitMessage
+    from opentelemetry import trace
+
+    settings = Settings(_env_file=None, tasks_queue="jobs-trace")
+    broker = make_broker(settings)
+    seen = []
+
+    @broker.subscriber(settings.tasks_queue)
+    async def consume(message: RabbitMessage):
+        seen.append((message.headers, message.raw_message.correlation_id))
+
+    message = make_message()
+    async with TestRabbitBroker(broker):
+        with trace.get_tracer("t").start_as_current_span("root") as root:
+            await publish_task(broker, settings, message)
+
+    [(headers, correlation_id)] = seen
+    assert correlation_id == str(message.task_id)
+    trace_id = format(root.get_span_context().trace_id, "032x")
+    assert headers["traceparent"].split("-")[1] == trace_id
+    names = {span.name: span for span in spans.get_finished_spans()}
+    process = next(span for name, span in names.items() if name.endswith("process"))
+    assert format(process.context.trace_id, "032x") == trace_id
 
 
 async def test_declare_topology_declares_dlx_dlq_binding_and_queue():
@@ -131,7 +159,12 @@ async def test_publish_task_sends_one_persistent_confirmed_message():
     [(body, kwargs)] = broker.published
     assert body["task_id"] == str(message.task_id)
     assert TaskMessage.model_validate(body) == message
-    assert kwargs == {"queue": "jobs", "persist": True, "timeout": 1.5}
+    assert kwargs == {
+        "queue": "jobs",
+        "persist": True,
+        "timeout": 1.5,
+        "correlation_id": str(message.task_id),
+    }
 
 
 async def test_nack_from_broker_is_queue_full():

@@ -16,6 +16,7 @@ from uuid import UUID
 from aio_pika.exceptions import AMQPException
 from aiormq.exceptions import AMQPError, ChannelInvalidStateError, DeliveryError
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
+from faststream.rabbit.opentelemetry import RabbitTelemetryMiddleware
 from faststream.rabbit.schemas import Channel
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -66,13 +67,18 @@ def make_broker(
     prefetch_count: int | None = None,
     graceful_timeout: float | None = None,
 ) -> RabbitBroker:
-    """Broker whose channel uses publisher confirms (the aio-pika/FastStream default, made explicit)."""
+    """Broker whose channel uses publisher confirms (the aio-pika/FastStream default, made explicit).
+
+    Its telemetry middleware puts ``traceparent`` into published messages and continues the trace
+    in the consumer. Without an SDK provider the middleware uses no-op tracers.
+    """
     options = {} if graceful_timeout is None else {"graceful_timeout": graceful_timeout}
     return RabbitBroker(
         settings.rabbitmq_url,
         default_channel=Channel(prefetch_count=prefetch_count, publisher_confirms=True),
         # The project logs through agent_platform.core.logging, not FastStream's own logger.
         logger=None,
+        middlewares=[RabbitTelemetryMiddleware()],
         **options,
     )
 
@@ -101,6 +107,8 @@ async def publish_task(broker: RabbitBroker, settings: Settings, message: TaskMe
                 queue=settings.tasks_queue,
                 persist=True,
                 timeout=timeout,
+                # The task id travels with the message: the worker logs it as ``task_id``.
+                correlation_id=str(message.task_id),
             )
     except DeliveryError as exc:
         raise QueueFullError(settings.tasks_queue) from exc
