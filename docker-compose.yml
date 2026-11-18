@@ -13,10 +13,20 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
       HEALTH_TIMEOUT_SECONDS: ${HEALTH_TIMEOUT_SECONDS:-2}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-fly-policy}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      # Single-row predictions gain nothing from BLAS threads sized by host cores.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      # The root filesystem is read-only; MLflow and matplotlib write caches under HOME.
+      HOME: /tmp
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     depends_on:
       db:
+        condition: service_healthy
+      mlflow:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
@@ -28,10 +38,10 @@ services:
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      - /tmp:size=64m,mode=1777
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1.0
     logging:
       driver: json-file
@@ -66,8 +76,203 @@ services:
         max-file: "3"
     networks: [backend]
 
+  mlflow-db:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: ${MLFLOW_DB:-mlflow}
+      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:?Copy .env.example to .env and set MLFLOW_DB_PASSWORD}
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  # MinIO no longer publishes images to Docker Hub or Quay, so the last
+  # pullable, pinned build is taken from the Bitnami legacy repository.
+  minio:
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+    # The Bitnami entrypoint script restarts MinIO and polls it with mc for over a minute;
+    # starting the server binary directly makes the healthcheck window predictable.
+    entrypoint: ["/opt/bitnami/minio/bin/minio"]
+    command: ["server", "/bitnami/minio/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Copy .env.example to .env and set MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  # One-shot job: creates the artifact bucket and exits. Idempotent, so reruns are harmless.
+  minio-init:
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc --config-dir /tmp/mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        && mc --config-dir /tmp/mc mb --ignore-existing "local/$$MLFLOW_BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Copy .env.example to .env and set MINIO_ROOT_PASSWORD}
+      MLFLOW_BUCKET: ${MLFLOW_BUCKET:-mlflow}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  mlflow:
+    image: ${MLFLOW_IMAGE:-mlops-muha-mlflow:local}
+    build:
+      context: ./mlflow
+    # Metadata goes to mlflow-db. Artifacts are proxied: clients talk only HTTP to this
+    # server, which alone holds the MinIO credentials and writes to s3://<bucket>.
+    # Host-header checks stay on; --allowed-hosts lists every name clients really use
+    # (browser on the host and other containers via the service name).
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --workers
+      - "1"
+      - --allowed-hosts
+      - localhost,localhost:*,127.0.0.1,127.0.0.1:*,mlflow,mlflow:*
+      - --backend-store-uri
+      - postgresql+psycopg2://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD}@mlflow-db:5432/${MLFLOW_DB:-mlflow}
+      - --serve-artifacts
+      - --artifacts-destination
+      - s3://${MLFLOW_BUCKET:-mlflow}
+      - --default-artifact-root
+      - mlflow-artifacts:/
+    environment:
+      # The background job runner (GenAI scorers, etc.) forks a dozen huey workers
+      # and needs ~1 GB; experiment tracking and the registry do not use it.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Copy .env.example to .env and set MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
+      HOME: /tmp
+    ports:
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      start_period: 30s
+      retries: 5
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  # Training pipeline: `docker compose --profile train run --rm pipeline`.
+  pipeline:
+    profiles: ["train"]
+    image: ${TRAINER_IMAGE:-mlops-muha-trainer:local}
+    build:
+      context: .
+      target: trainer
+    # The root filesystem is read-only, so generated parquet files go to the /tmp tmpfs.
+    command: ["python", "-m", "agent_platform.training.pipeline", "--work-dir", "/tmp/generated"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      FLY_MODEL_NAME: ${MODEL_NAME:-fly-policy}
+      FLY_MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      # BLAS sizes its thread pool by host cores, not by the cpus limit below; the
+      # oversubscribed threads get throttled and small matrix products become many times slower.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      HOME: /tmp
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    init: true
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
 volumes:
   postgres_data:
+  mlflow_db_data:
+  minio_data:
 
 networks:
   backend:

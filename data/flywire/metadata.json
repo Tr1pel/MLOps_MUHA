@@ -1,0 +1,30 @@
+{
+  "source": "FlyWire connectome v783 connectivity table (Shiu et al. brain model)",
+  "source_url": "https://raw.githubusercontent.com/philshiu/Drosophila_brain_model/91bdd1e7dcf193f3e7ca5a8933497fcef63b7960/Connectivity_783.parquet",
+  "repository": "https://github.com/philshiu/Drosophila_brain_model",
+  "repository_commit": "91bdd1e7dcf193f3e7ca5a8933497fcef63b7960",
+  "raw_file": "Connectivity_783.parquet",
+  "raw_file_sha256": "efeb23fb99098e9c390f6869969b2a121a2ee92c833cfc45ecb2c1d8e1af0347",
+  "raw_file_bytes": 100804642,
+  "raw_rows": 15091983,
+  "raw_neurons": 138639,
+  "flywire_version": 783,
+  "selection": {
+    "method": "top neurons by total synapse count (in+out), largest strongly connected component of the induced subgraph",
+    "n_candidates": 400,
+    "edge_weight": "signed synapse count: 'Excitatory x Connectivity' of the raw table"
+  },
+  "counts": {
+    "neurons": 400,
+    "edges": 10970,
+    "excitatory_edges": 5665,
+    "inhibitory_edges": 5305,
+    "density": 0.068562,
+    "synapses": 321819
+  },
+  "files": {
+    "subgraph_edges.parquet": "be85b7a1d4d3192d58e92786ee7fcde810e48e40e37d762871d64c67ecb73c63",
+    "subgraph_neurons.parquet": "7715fe3e9e9510220317d595721246f1057575147e88f6529bca37195e3e5a99"
+  },
+  "license_note": "Connectivity table from the FlyWire connectome (Dorkenwald et al. 2024, Nature; Schlegel et al. 2024, Nature), as packaged by Shiu et al. 2024 (Nature), repository github.com/philshiu/Drosophila_brain_model (code under the MIT licence). The FlyWire data are subject to the FlyWire/Codex terms of use (flywire.ai); cite these papers when reusing the subgraph."
+}
