@@ -1,3 +1,16 @@
+# Settings shared by the API, worker and source so the queue contract cannot drift.
+x-pipeline-env: &pipeline-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_USER: ${RABBITMQ_USER:-agent}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Copy .env.example to .env and set RABBITMQ_PASSWORD}
+  TASKS_QUEUE: ${TASKS_QUEUE:-tasks}
+  QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-50}
+  TASK_DELIVERY_LIMIT: ${TASK_DELIVERY_LIMIT:-3}
+  INFERENCE_SECONDS: ${INFERENCE_SECONDS:-0.5}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  PUBLISH_TIMEOUT_SECONDS: ${PUBLISH_TIMEOUT_SECONDS:-2}
+
 services:
   app:
     image: ${APP_IMAGE:-mlops-muha:local}
@@ -6,6 +19,7 @@ services:
       args:
         APP_COMMIT: ${APP_COMMIT:-unknown}
     environment:
+      <<: *pipeline-env
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
@@ -13,20 +27,13 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
       HEALTH_TIMEOUT_SECONDS: ${HEALTH_TIMEOUT_SECONDS:-2}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MODEL_NAME: ${MODEL_NAME:-fly-policy}
-      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
-      # Single-row predictions gain nothing from BLAS threads sized by host cores.
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      # The root filesystem is read-only; MLflow and matplotlib write caches under HOME.
       HOME: /tmp
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
-      mlflow:
+      rabbitmq:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
@@ -42,6 +49,120 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  rabbitmq:
+    image: rabbitmq:4.1.8-management
+    # RabbitMQ keys its data directory by node name, which derives from the hostname.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-agent}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Copy .env.example to .env and set RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    # The limit matters for the experiment: with an unbounded queue memory grows until it bites.
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  # Scale with `docker compose up -d --scale worker=2`: no container_name, no host ports.
+  worker:
+    image: ${APP_IMAGE:-mlops-muha:local}
+    command: ["python", "-m", "agent_platform.worker"]
+    environment:
+      <<: *pipeline-env
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKER_HEALTH_PORT: ${WORKER_HEALTH_PORT:-8001}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-fly-policy}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      # Single-row predictions gain nothing from BLAS threads sized by host cores.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      # The root filesystem is read-only; MLflow and matplotlib write caches under HOME.
+      HOME: /tmp
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('WORKER_HEALTH_PORT', '8001'), timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+    init: true
+    # The worker finishes the tasks it has already taken before exiting.
+    stop_grace_period: 30s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [backend]
+
+  # Task generator: `docker compose --profile load up -d source` or
+  # `docker compose --profile load run --rm source --count 500`.
+  source:
+    profiles: ["load"]
+    image: ${APP_IMAGE:-mlops-muha:local}
+    # Arguments after `run source` replace only `command`, so `run --rm source --count 500` works.
+    # --max-steps 10 keeps the episode compute well under INFERENCE_SECONDS (see README).
+    entrypoint: ["python", "-m", "agent_platform.source"]
+    command: ["--count", "100000", "--max-steps", "10"]
+    environment:
+      <<: *pipeline-env
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HOME: /tmp
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    init: true
+    stop_grace_period: 10s
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
     cpus: 1.0
     logging:
       driver: json-file
@@ -273,6 +394,7 @@ volumes:
   postgres_data:
   mlflow_db_data:
   minio_data:
+  rabbitmq_data:
 
 networks:
   backend:

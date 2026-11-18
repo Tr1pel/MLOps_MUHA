@@ -1,21 +1,10 @@
-"""Load the registered policy once at startup and run episodes with it.
-
-Concurrency model: an episode is synchronous CPU-bound Python, so it runs in a dedicated
-``ThreadPoolExecutor`` of ``inference_concurrency`` workers, never on the event loop. An
-``asyncio.Semaphore`` of the same size gates access, so the pool queue is always empty and
-excess requests wait (cancellably, with a timeout) on the event loop instead of piling up
-in the pool. The semaphore slot is released when the *thread* finishes, not when the
-request is cancelled, so the bound holds even if clients disconnect mid-episode. A fitted
-scikit-learn pipeline is only read by ``predict`` (no state is mutated), so one shared
-instance is used by all workers.
-"""
+"""Load the registered policy from MLflow and run one episode with it (used by the worker)."""
 
 import asyncio
 import os
 import tempfile
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
@@ -26,7 +15,6 @@ import numpy as np
 from sklearn import config_context
 
 from agent_platform.core.config import Settings
-from agent_platform.core.logging import logger
 from agent_platform.sim.env import OBS_DIM
 from agent_platform.sim.episode import EpisodeResult, run_episode
 
@@ -42,10 +30,6 @@ class ModelLoadError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-class ModelBusyError(Exception):
-    """No inference slot became free within the configured queue timeout."""
 
 
 @dataclass(frozen=True)
@@ -170,105 +154,6 @@ async def _run_in_daemon_thread[T](func: Callable[[], T], timeout_seconds: float
     threading.Thread(target=target, name="model-loader", daemon=True).start()
     async with asyncio.timeout(timeout_seconds):
         return await future
-
-
-class ModelService:
-    """Holds the single loaded model (or the reason there is none) for the process lifetime."""
-
-    def __init__(self, settings: Settings, loaded: LoadedModel | None, failure: str | None):
-        self.name = settings.model_name
-        self.alias = settings.model_alias
-        self.loaded = loaded
-        self.failure = failure
-        self._queue_timeout = settings.inference_queue_timeout_seconds
-        self._slots = asyncio.Semaphore(settings.inference_concurrency)
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=settings.inference_concurrency, thread_name_prefix="inference"
-            )
-            if loaded
-            else None
-        )
-
-    @classmethod
-    async def start(
-        cls, settings: Settings, loader: ModelLoader = load_registered_model
-    ) -> "ModelService":
-        """Load once. Never raises: a failed load yields a service that reports why."""
-        if settings.mlflow_tracking_uri is None:
-            logger.info("model_load_skipped", extra={"reason": NOT_CONFIGURED})
-            return cls(settings, None, NOT_CONFIGURED)
-        started = perf_counter()
-        try:
-            loaded = await _run_in_daemon_thread(
-                lambda: loader(settings), settings.model_load_timeout_seconds
-            )
-        except Exception as exc:
-            # CancelledError is a BaseException and is deliberately not swallowed here.
-            if isinstance(exc, TimeoutError):
-                reason = LOAD_TIMEOUT
-            elif isinstance(exc, ModelLoadError):
-                reason = exc.reason
-            else:
-                reason = LOAD_FAILED
-            logger.error(
-                "model_load_failed",
-                extra={
-                    "reason": reason,
-                    "error_type": type(exc).__name__,
-                    "model_name": settings.model_name,
-                    "model_alias": settings.model_alias,
-                    "duration_ms": round((perf_counter() - started) * 1000, 3),
-                },
-            )
-            return cls(settings, None, reason)
-        info = loaded.info
-        logger.info(
-            "model_loaded",
-            extra={
-                "model_name": info.name,
-                "model_alias": info.alias,
-                "model_version": info.version,
-                "run_id": info.run_id,
-                "duration_ms": info.load_duration_ms,
-            },
-        )
-        return cls(settings, loaded, None)
-
-    @property
-    def info(self) -> ModelInfo | None:
-        return self.loaded.info if self.loaded else None
-
-    async def run_episode(self, seed: int, max_steps: int) -> EpisodeResult:
-        if self.loaded is None or self._executor is None:
-            raise ModelLoadError(self.failure or LOAD_FAILED)
-        try:
-            async with asyncio.timeout(self._queue_timeout):
-                await self._slots.acquire()
-        except TimeoutError:
-            raise ModelBusyError from None
-        loop = asyncio.get_running_loop()
-        try:
-            worker = self._executor.submit(_episode, self.loaded.model, seed, max_steps)
-        except BaseException:
-            self._slots.release()
-            raise
-
-        def release_slot(_: object) -> None:
-            try:
-                loop.call_soon_threadsafe(self._slots.release)
-            except RuntimeError:  # loop closed during shutdown
-                pass
-
-        # Free the slot when the worker thread is really done, even if this request is
-        # cancelled first (a running thread cannot be cancelled); otherwise abandoned
-        # episodes would exceed the concurrency bound.
-        worker.add_done_callback(release_slot)
-        return await asyncio.wrap_future(worker)
-
-    def close(self) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _episode(model: Any, seed: int, max_steps: int) -> EpisodeResult:

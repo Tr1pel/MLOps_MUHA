@@ -2,8 +2,11 @@
 
 import argparse
 import json
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+TASK_TIMEOUT_SECONDS = 60
 
 
 def fetch(base_url: str, path: str, body: dict | None = None) -> tuple[int, dict]:
@@ -22,9 +25,9 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--database-down", action="store_true")
     parser.add_argument(
-        "--process",
+        "--tasks",
         action="store_true",
-        help="also run POST /process and require a loaded model (needs MLflow and a trained model)",
+        help="also submit a task and wait for DONE (needs RabbitMQ, a worker and a trained model)",
     )
     parser.add_argument("--commit")
     parser.add_argument("--version")
@@ -48,18 +51,24 @@ def main() -> None:
         assert status == 200 and health["status"] == "ok", (status, health)
         assert component["status"] == "ok" and component["version"], component
     report = {"liveness": live, "build": version, "health": health}
-    if args.process:
-        status, model = fetch(args.base_url, "/api/v1/model")
-        assert status == 200 and model["loaded"] and model["version"], (status, model)
-        status, episode = fetch(args.base_url, "/process", {"seed": 1, "max_steps": 50})
-        assert status == 200, (status, episode)
-        assert 1 <= episode["steps"] <= 50, episode
-        assert len(episode["trajectory"]) == episode["steps"] + 1, episode
-        assert isinstance(episode["success"], bool) and episode["collisions"] >= 0, episode
-        assert episode["model"]["version"] == model["version"], (episode["model"], model)
-        report["model"] = model
-        report["process"] = {key: value for key, value in episode.items() if key != "trajectory"}
-        print(f"model in use: {model['name']}@{model['alias']} version {model['version']}")
+    if args.tasks:
+        status, accepted = fetch(args.base_url, "/api/v1/tasks", {"seed": 1, "max_steps": 50})
+        assert status == 202 and accepted["status"] == "PENDING", (status, accepted)
+        path = f"/api/v1/tasks/{accepted['task_id']}"
+        deadline = time.monotonic() + TASK_TIMEOUT_SECONDS
+        while True:
+            status, task = fetch(args.base_url, path)
+            assert status == 200, (status, task)
+            if task["status"] == "DONE":
+                break
+            assert time.monotonic() < deadline, f"task not DONE in {TASK_TIMEOUT_SECONDS}s: {task}"
+            time.sleep(0.5)
+        result = task["result"]
+        assert 1 <= result["steps"] <= 50 and task["model_version"], task
+        assert len(result["trajectory"]) == result["steps"] + 1, result
+        assert isinstance(result["success"], bool) and result["collisions"] >= 0, result
+        report["task"] = {key: value for key, value in task.items() if key != "result"}
+        print(f"task {task['task_id']} done with model version {task['model_version']}")
     print(json.dumps(report, indent=2))
 
 

@@ -80,6 +80,7 @@ jobs:
       POSTGRES_PASSWORD: ci-only-password
       MLFLOW_DB_PASSWORD: ci-only-mlflow-password
       MINIO_ROOT_PASSWORD: ci-only-minio-password
+      RABBITMQ_PASSWORD: ci-only-rabbit-password
       APP_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,8 +89,10 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Build and start application, database and MLflow stack
-        run: docker compose up --build --wait --wait-timeout 300
+      # The worker needs a registered model, which a fresh CI MLflow does not have, so only the
+      # API and its dependencies (PostgreSQL, RabbitMQ) are started here.
+      - name: Build and start application, database and RabbitMQ
+        run: docker compose up --build --wait --wait-timeout 300 app
       - name: Check all endpoints and image build identity
         run: python scripts/smoke.py --commit "$APP_COMMIT"
       - name: Check graceful database failure
@@ -122,6 +125,7 @@ jobs:
       POSTGRES_PASSWORD: ci-only-password
       MLFLOW_DB_PASSWORD: ci-only-mlflow-password
       MINIO_ROOT_PASSWORD: ci-only-minio-password
+      RABBITMQ_PASSWORD: ci-only-rabbit-password
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,9 +164,8 @@ jobs:
           APP_COMMIT: ${{ github.sha }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          docker compose pull app db mlflow-db minio minio-init
-          docker compose build mlflow
-          docker compose up --no-build --wait --wait-timeout 300
+          docker compose pull app db rabbitmq
+          docker compose up --no-build --wait --wait-timeout 300 app
           python scripts/smoke.py --commit "$APP_COMMIT" --version "$PACKAGE_VERSION"
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo "$APP_IMAGE" >> "$GITHUB_STEP_SUMMARY"

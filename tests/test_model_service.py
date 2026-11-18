@@ -1,18 +1,11 @@
-import io
-import json
-import logging
-import threading
-
 import numpy as np
 import pytest
-from conftest import FakePolicy, make_loaded
+from conftest import FakePolicy
 
 import agent_platform.ml.inference as inference
 from agent_platform.core.config import Settings
-from agent_platform.core.logging import JsonFormatter, configure_logging, logger
 from agent_platform.ml.inference import (
     ModelLoadError,
-    ModelService,
     _redact,
     load_registered_model,
 )
@@ -133,71 +126,6 @@ def test_missing_run_id_and_credentials_in_source(settings, events, monkeypatch)
 )
 def test_redact(raw, expected):
     assert _redact(raw) == expected
-
-
-async def test_start_logs_alias_and_version_without_secrets(capsys):
-    configure_logging("INFO")
-    secret = Settings(_env_file=None, mlflow_tracking_uri="http://u:hunter2@mlflow.test")
-    service = await ModelService.start(secret, lambda s: make_loaded(version="9"))
-    service.close()
-    out = capsys.readouterr().out
-    line = next(json.loads(row) for row in out.splitlines() if "model_loaded" in row)
-    assert line["model_alias"] == "champion"
-    assert line["model_version"] == "9"
-    assert line["run_id"] == "run-abc"
-    assert line["duration_ms"] == 12.5
-    assert "hunter2" not in out
-
-
-async def test_start_without_tracking_uri_skips_loader(capsys):
-    configure_logging("INFO")
-    service = await ModelService.start(
-        Settings(_env_file=None), raising(AssertionError("loader must not run"))
-    )
-    assert service.info is None and service.failure == "not_configured"
-    assert "model_load_skipped" in capsys.readouterr().out
-    with pytest.raises(ModelLoadError):
-        await service.run_episode(1, 5)
-
-
-async def test_failure_categories(settings):
-    service = await ModelService.start(settings, raising(ModelLoadError("alias_not_found")))
-    assert service.failure == "alias_not_found"
-    service = await ModelService.start(settings, raising(OSError("x")))
-    assert service.failure == "load_failed"
-
-
-async def test_timeout_abandons_hung_loader_without_blocking(settings):
-    release = threading.Event()
-    done = threading.Event()
-    quick = settings.model_copy(update={"model_load_timeout_seconds": 0.05})
-
-    def hung(s):
-        release.wait(5)
-        done.set()
-        return make_loaded()
-
-    service = await ModelService.start(quick, hung)
-    assert service.failure == "timeout"
-    release.set()
-    assert done.wait(2)  # the late result is dropped by the abandoned future
-
-
-async def test_load_failure_log_has_type_not_message(settings):
-    output = io.StringIO()
-    handler = logging.StreamHandler(output)
-    handler.setFormatter(JsonFormatter())
-    old = logger.handlers
-    logger.handlers = [handler]
-    try:
-        await ModelService.start(settings, raising(KeyError("pw=zzz")))
-    finally:
-        logger.handlers = old
-    row = json.loads(output.getvalue().splitlines()[0])
-    assert row["event"] == "model_load_failed"
-    assert row["error_type"] == "KeyError"
-    assert row["reason"] == "load_failed"
-    assert "zzz" not in output.getvalue()
 
 
 def test_blank_tracking_uri_means_unset():
