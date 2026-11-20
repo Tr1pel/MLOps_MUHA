@@ -1,0 +1,13 @@
+{
+  "label": "A",
+  "queue": "tasks-unbounded",
+  "max_length": 0,
+  "batch_id": "exp-a2",
+  "max_steps": 10,
+  "t0": "2026-11-18T02:44:39.005715+00:00",
+  "scale_at_s": 90.0,
+  "duration_s": 180,
+  "tasks_done": 1031,
+  "source_published_total": 176172,
+  "source_rejected_total": 0
+}

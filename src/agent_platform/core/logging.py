@@ -30,6 +30,11 @@ class JsonFormatter(logging.Formatter):
             "commit",
             "component",
             "error_type",
+            "reason",
+            "model_name",
+            "model_alias",
+            "model_version",
+            "run_id",
         ):
             if hasattr(record, field):
                 payload[field] = getattr(record, field)

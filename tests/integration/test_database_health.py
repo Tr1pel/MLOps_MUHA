@@ -4,6 +4,7 @@ import re
 import httpx
 import pytest
 from asgi_lifespan import LifespanManager
+from conftest import FakeBroker
 
 from agent_platform.core.config import Settings
 from agent_platform.db.connection import postgres_version
@@ -16,7 +17,7 @@ pytestmark = [
 
 
 async def test_health_against_real_postgresql():
-    app = create_app(Settings())
+    app = create_app(Settings(), broker_factory=FakeBroker)
     async with LifespanManager(app):
         actual_version = await postgres_version(app.state.engine)
         assert re.match(r"\d+\.\d+", actual_version)

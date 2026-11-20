@@ -55,7 +55,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --locked --group web
+        run: uv sync --locked --group web --group train
       - name: Lint and format check
         run: |
           uv run --locked ruff check .
@@ -63,7 +63,7 @@ jobs:
       - name: Repository hygiene
         run: uv run --locked pre-commit run --all-files
       - name: Unit and PostgreSQL integration tests
-        run: uv run --locked --group web pytest --cov=agent_platform --cov-report=term-missing --cov-report=xml
+        run: uv run --locked --group web --group train pytest --cov=agent_platform --cov-report=term-missing --cov-report=xml
       - name: Save coverage report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -75,9 +75,12 @@ jobs:
   container:
     name: Compose and failure recovery
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       POSTGRES_PASSWORD: ci-only-password
+      MLFLOW_DB_PASSWORD: ci-only-mlflow-password
+      MINIO_ROOT_PASSWORD: ci-only-minio-password
+      RABBITMQ_PASSWORD: ci-only-rabbit-password
       APP_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,8 +89,10 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Build and start application and database
-        run: docker compose up --build --wait --wait-timeout 120
+      # The worker needs a registered model, which a fresh CI MLflow does not have, so only the
+      # API and its dependencies (PostgreSQL, RabbitMQ) are started here.
+      - name: Build and start application, database and RabbitMQ
+        run: docker compose up --build --wait --wait-timeout 300 app
       - name: Check all endpoints and image build identity
         run: python scripts/smoke.py --commit "$APP_COMMIT"
       - name: Check graceful database failure
@@ -118,6 +123,9 @@ jobs:
       packages: write
     env:
       POSTGRES_PASSWORD: ci-only-password
+      MLFLOW_DB_PASSWORD: ci-only-mlflow-password
+      MINIO_ROOT_PASSWORD: ci-only-minio-password
+      RABBITMQ_PASSWORD: ci-only-rabbit-password
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -156,8 +164,8 @@ jobs:
           APP_COMMIT: ${{ github.sha }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          docker compose pull app db
-          docker compose up --no-build --wait --wait-timeout 120
+          docker compose pull app db rabbitmq
+          docker compose up --no-build --wait --wait-timeout 300 app
           python scripts/smoke.py --commit "$APP_COMMIT" --version "$PACKAGE_VERSION"
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo "$APP_IMAGE" >> "$GITHUB_STEP_SUMMARY"
