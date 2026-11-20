@@ -1,0 +1,57 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Must stay first: it sheds load before anything else allocates memory.
+  # Limits sit below the container mem_limit (256m) so the Collector refuses data instead of being OOM-killed.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 160
+    spike_limit_mib: 40
+  # Must stay last.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    # Profiles can start only one backend; a bounded retry keeps the missing one from piling up data.
+    retry_on_failure:
+      max_elapsed_time: 30s
+    sending_queue:
+      queue_size: 200
+  otlphttp/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+    tls:
+      insecure: true
+    retry_on_failure:
+      max_elapsed_time: 30s
+    sending_queue:
+      queue_size: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/prometheus]
+  telemetry:
+    metrics:
+      level: none

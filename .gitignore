@@ -18,3 +18,14 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+
+data/raw/
+data/generated/
+mlruns/
+mlartifacts/
+mlflow.db
+
+# Local tooling and course hand-outs
+.claude/
+CLAUDE.md
+*.pdf

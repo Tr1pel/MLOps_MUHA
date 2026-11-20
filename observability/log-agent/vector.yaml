@@ -1,0 +1,42 @@
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+
+sources:
+  docker:
+    type: docker_logs
+    # Only this Compose project: other containers on the host are never read.
+    include_labels:
+      - "com.docker.compose.project=${COMPOSE_PROJECT_NAME:-mlops_muha}"
+
+transforms:
+  labels:
+    type: remap
+    inputs: [docker]
+    source: |
+      compose_service = string(.label."com.docker.compose.service") ?? "unknown"
+      .service = compose_service
+      .level = "unknown"
+      # .message stays the original line so that `| json` and derived fields work in Grafana.
+      parsed, err = parse_json(.message)
+      if err == null && is_object(parsed) {
+        if is_string(parsed.service) { .service = parsed.service }
+        if is_string(parsed.level) { .level = downcase!(parsed.level) }
+      }
+      .env = get_env_var("DEPLOYMENT_ENV") ?? "dev"
+
+sinks:
+  loki:
+    type: loki
+    inputs: [labels]
+    endpoint: http://loki:3100
+    encoding:
+      codec: text
+    labels:
+      service: "{{ service }}"
+      level: "{{ level }}"
+      env: "{{ env }}"
+    out_of_order_action: accept
+    buffer:
+      type: memory
+      max_events: 500
